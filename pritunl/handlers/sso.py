@@ -12,13 +12,36 @@ from pritunl import sso
 from pritunl import event
 from pritunl import logger
 from pritunl import journal
-
+import msal
 import flask
 import hmac
 import hashlib
 import base64
 import urllib.parse
 import requests
+
+AUTHORITY = f"https://login.microsoftonline.com/{settings.app.sso_azure_directory_id}"
+
+def _build_auth_code_flow(authority=None, scopes=None, state=None):
+    return _build_msal_app(authority=authority).initiate_auth_code_flow(
+        scopes or [],
+        redirect_uri=f"https://{settings.app.acme_domain}/sso/callback",
+        state=state)
+
+def _build_msal_app(cache=None, authority=None):
+    return msal.ConfidentialClientApplication(
+        settings.app.sso_azure_app_id, authority=authority or AUTHORITY,
+        client_credential=settings.app.sso_azure_app_secret, token_cache=cache)
+
+def _load_cache():
+    cache = msal.SerializableTokenCache()
+    if flask.session.get("token_cache"):
+        cache.deserialize(flask.session["token_cache"])
+    return cache
+
+def _save_cache(cache):
+    if cache.has_state_changed:
+        flask.session["token_cache"] = cache.serialize()
 
 def _validate_user(username, email, sso_mode, org_id, groups, remote_addr,
         http_redirect=False, yubico_id=None):
@@ -268,6 +291,8 @@ def sso_request_get():
     state = utils.rand_str(64)
     secret = utils.rand_str(64)
     callback = utils.get_url_root() + '/sso/callback'
+
+    SCOPE = ["User.ReadBasic.All", "User.Read", "User.Read.All"]
     auth_server = AUTH_SERVER
     if settings.app.dedicated:
         auth_server = settings.app.dedicated
@@ -277,33 +302,7 @@ def sso_request_get():
         return flask.abort(405)
 
     if AZURE_AUTH in sso_mode:
-        resp = requests.post(auth_server + '/v1/request/azure',
-            headers={
-                'Content-Type': 'application/json',
-            },
-            json={
-                'license': settings.app.license,
-                'callback': callback,
-                'state': state,
-                'secret': secret,
-                'region': settings.app.sso_azure_region or '',
-                'directory_id': settings.app.sso_azure_directory_id,
-                'app_id': settings.app.sso_azure_app_id,
-                'app_secret': settings.app.sso_azure_app_secret,
-            },
-        )
-
-        if resp.status_code != 200:
-            logger.error('Azure auth server error', 'sso',
-                status_code=resp.status_code,
-                content=resp.content,
-            )
-
-            if resp.status_code == 401:
-                return flask.abort(405)
-
-            return flask.abort(500)
-
+        flow = _build_auth_code_flow(scopes=SCOPE, state=state)
         tokens_collection = mongo.get_collection('sso_tokens')
         tokens_collection.insert({
             '_id': state,
@@ -312,9 +311,9 @@ def sso_request_get():
             'timestamp': utils.now(),
         })
 
-        data = resp.json()
+        flask.session["flow"] = flow
 
-        return utils.redirect(data['url'])
+        return utils.redirect(flow['auth_uri'])
 
     elif GOOGLE_AUTH in sso_mode:
         resp = requests.post(auth_server + '/v1/request/google',
@@ -489,7 +488,11 @@ def sso_callback_get():
 
     remote_addr = utils.get_remote_addr()
     state = flask.request.args.get('state')
-    sig = flask.request.args.get('sig')
+    code = flask.request.args.get('code')
+
+    if not state or not code:
+        logger.error('State or code parameter missing', 'sso')
+        return flask.abort(404)
 
     tokens_collection = mongo.get_collection('sso_tokens')
     doc = tokens_collection.find_and_modify(query={
@@ -499,20 +502,7 @@ def sso_callback_get():
     if not doc:
         return flask.abort(404)
 
-    query = flask.request.query_string.split('&sig='.encode())[0]
-    test_sig = base64.urlsafe_b64encode(hmac.new(str(doc['secret']).encode(),
-        query, hashlib.sha512).digest()).decode()
-    if not utils.const_compare(sig, test_sig):
-        journal.entry(
-            journal.SSO_AUTH_FAILURE,
-            state=state,
-            remote_address=remote_addr,
-            reason=journal.SSO_AUTH_REASON_INVALID_CALLBACK,
-            reason_long='Signature mismatch',
-        )
-        return flask.abort(401)
-
-    params = urllib.parse.parse_qs(query.decode())
+    params = urllib.parse.parse_qs(flask.request.query_string.decode())
 
     if doc.get('type') == SAML_AUTH:
         username = params.get('username')[0]
@@ -724,11 +714,38 @@ def sso_callback_get():
                     org_names=google_groups,
                 )
     elif doc.get('type') == AZURE_AUTH:
-        username = params.get('username')[0]
-        email = None
+        try:
+            cache = _load_cache()
+            
+            # Retrieve the state from the session flow
+            auth_flow = flask.session.get("flow", {})
+            if 'state' not in auth_flow:
+                return flask.abort(401)
+            
+            result = _build_msal_app(cache=cache).acquire_token_by_auth_code_flow(
+                auth_flow, flask.request.args
+            )
+            
+            if "error" in result:
+                journal.entry(
+                    journal.SSO_AUTH_FAILURE,
+                    state=state,
+                    remote_address=remote_addr,
+                    reason=journal.SSO_AUTH_REASON_AZURE_FAILED,
+                    reason_long=f"Azure authentication failed: {result['error_description']}",
+                )
+                return flask.abort(401)
+            
+            flask.session["user"] = result.get("id_token_claims")
+            _save_cache(cache)
+        except ValueError as e:
+            return flask.abort(401)
 
-        tenant, username = username.split('/', 2)
-        if tenant != settings.app.sso_azure_directory_id:
+        username = flask.session["user"].get('preferred_username')
+        email = flask.session["user"].get('email', None)
+        tenantId = flask.session["user"].get('tid')
+
+        if tenantId != settings.app.sso_azure_directory_id:
             logger.error('Azure directory ID mismatch', 'sso',
                 username=username,
             )
@@ -736,7 +753,7 @@ def sso_callback_get():
             journal.entry(
                 journal.SSO_AUTH_FAILURE,
                 user_name=username,
-                azure_tenant=tenant,
+                azure_tenant=tenantId,
                 remote_address=remote_addr,
                 reason=journal.SSO_AUTH_REASON_AZURE_FAILED,
                 reason_long='Azure directory ID mismatch',

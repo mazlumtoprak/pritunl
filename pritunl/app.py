@@ -8,6 +8,7 @@ from pritunl import utils
 from pritunl import monitoring
 from pritunl import auth
 from pritunl import acme
+from flask_session import Session
 
 import threading
 import flask
@@ -18,8 +19,20 @@ import base64
 import cheroot.wsgi
 import ssl
 
+SESSION_TYPE = 'filesystem'
+SESSION_FILE_DIR = '/tmp/flask_session/'  # Make sure this directory exists and is writable
+SESSION_PERMANENT = False
+SESSION_USE_SIGNER = True
+
 app = flask.Flask(__name__)
 app_server = None
+app.config.update(
+    SESSION_TYPE=SESSION_TYPE,
+    SESSION_FILE_DIR=SESSION_FILE_DIR,
+    SESSION_PERMANENT=SESSION_PERMANENT,
+    SESSION_USE_SIGNER=SESSION_USE_SIGNER
+)
+Session(app)  # Initialize the Flask-Session extension
 _cur_ssl = None
 _cur_cert = None
 _cur_key = None
